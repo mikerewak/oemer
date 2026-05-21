@@ -12,7 +12,7 @@ import numpy as np
 
 from oemer import MODULE_PATH
 from oemer import layers
-from oemer.inference import inference
+from oemer.inference import inference, should_parallel_inference
 from oemer.utils import get_logger
 from oemer.dewarp import estimate_coords, dewarp
 from oemer.staffline_extraction import extract as staff_extract
@@ -44,28 +44,39 @@ def clear_data():
 
 def generate_pred(img_path, use_tf=False):
     logger.info("Extracting staffline and symbols")
-    staff_symbols_map, _ = inference(
-        os.path.join(MODULE_PATH, "checkpoints/unet_big"),
-        img_path,
-        use_tf=use_tf,
-    )
+
+    if not use_tf and should_parallel_inference():
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_unet = ex.submit(
+                inference,
+                os.path.join(MODULE_PATH, "checkpoints/unet_big"),
+                img_path,
+            )
+            f_seg = ex.submit(
+                inference,
+                os.path.join(MODULE_PATH, "checkpoints/seg_net"),
+                img_path,
+            )
+            staff_symbols_map, _ = f_unet.result()
+            sep, _ = f_seg.result()
+    else:
+        staff_symbols_map, _ = inference(
+            os.path.join(MODULE_PATH, "checkpoints/unet_big"),
+            img_path,
+            use_tf=use_tf,
+        )
+        sep, _ = inference(
+            os.path.join(MODULE_PATH, "checkpoints/seg_net"),
+            img_path,
+            use_tf=use_tf,
+        )
+
     staff = np.where(staff_symbols_map==1, 1, 0)
     symbols = np.where(staff_symbols_map==2, 1, 0)
-
-    logger.info("Extracting layers of different symbols")
-    symbol_thresholds = [0.5, 0.4, 0.4]
-    sep, _ = inference(
-        os.path.join(MODULE_PATH, "checkpoints/seg_net"),
-        img_path,
-        manual_th=None,
-        use_tf=use_tf,
-    )
     stems_rests = np.where(sep==1, 1, 0)
     notehead = np.where(sep==2, 1, 0)
     clefs_keys = np.where(sep==3, 1, 0)
-    # stems_rests = sep[..., 0]
-    # notehead = sep[..., 1]
-    # clefs_keys = sep[..., 2]
 
     return staff, symbols, stems_rests, notehead, clefs_keys
 
@@ -144,13 +155,12 @@ def extract(args):
     if not args.without_deskew:
         logger.info("Dewarping")
         coords_x, coords_y = estimate_coords(staff)
-        staff = dewarp(staff, coords_x, coords_y)
-        symbols = dewarp(symbols, coords_x, coords_y)
-        stems_rests = dewarp(stems_rests, coords_x, coords_y)
-        clefs_keys = dewarp(clefs_keys, coords_x, coords_y)
-        notehead = dewarp(notehead, coords_x, coords_y)
-        for i in range(image.shape[2]):
-            image[..., i] = dewarp(image[..., i], coords_x, coords_y)
+        # All five binary prediction maps in one remap call (5-channel stack).
+        pred_stack = np.stack([staff, symbols, stems_rests, clefs_keys, notehead], axis=-1).astype(np.float32)
+        pred_warped = cv2.remap(pred_stack, coords_x, coords_y, cv2.INTER_CUBIC)
+        staff, symbols, stems_rests, clefs_keys, notehead = (pred_warped[..., i] for i in range(5))
+        # cv2.remap natively handles 3-channel images — no per-channel loop needed.
+        image = cv2.remap(image.astype(np.float32), coords_x, coords_y, cv2.INTER_CUBIC).clip(0, 255).astype(np.uint8)
 
     # Register predictions
     symbols = symbols + clefs_keys + stems_rests

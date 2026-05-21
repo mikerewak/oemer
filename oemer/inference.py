@@ -1,6 +1,7 @@
 import os
 import pickle
 import platform
+import threading
 from functools import lru_cache
 from PIL import Image
 
@@ -11,6 +12,7 @@ from oemer import MODULE_PATH
 
 
 _CV2_THREADS_CONFIGURED = False
+_CV2_THREADS_LOCK = threading.Lock()
 
 
 def _machine_arch():
@@ -36,11 +38,14 @@ def _configure_cv2_threads():
     global _CV2_THREADS_CONFIGURED
     if _CV2_THREADS_CONFIGURED:
         return
-    default_threads = 1 if platform.system() == "Darwin" and _machine_arch() == "arm64" else 0
-    threads = _env_int("OEMER_OPENCV_THREADS", default_threads)
-    if threads > 0:
-        cv2.setNumThreads(threads)
-    _CV2_THREADS_CONFIGURED = True
+    with _CV2_THREADS_LOCK:
+        if _CV2_THREADS_CONFIGURED:
+            return
+        default_threads = 1 if platform.system() == "Darwin" and _machine_arch() == "arm64" else 0
+        threads = _env_int("OEMER_OPENCV_THREADS", default_threads)
+        if threads > 0:
+            cv2.setNumThreads(threads)
+        _CV2_THREADS_CONFIGURED = True
 
 
 def resize_image(image: Image):
@@ -101,25 +106,57 @@ def _onnx_provider_names():
 
     arch = _machine_arch()
     if platform.system() == "Darwin" and arch == "arm64":
-        return ("CPUExecutionProvider",)
+        return ("CoreMLExecutionProvider", "CPUExecutionProvider")
     if arch == "x86_64":
         return ("CUDAExecutionProvider", "CPUExecutionProvider")
     return ("CPUExecutionProvider",)
 
 
-def _onnx_session_options():
+def _onnx_session_options(opt_path=None):
     import onnxruntime as rt
 
     opts = rt.SessionOptions()
     opts.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    arch = _machine_arch()
+    is_apple_silicon = platform.system() == "Darwin" and arch == "arm64"
+
     intra_threads = _env_int("OEMER_ONNX_INTRA_OP_THREADS", 0)
     inter_threads = _env_int("OEMER_ONNX_INTER_OP_THREADS", 0)
+
+    if is_apple_silicon:
+        # CoreML EP manages its own parallelism (ANE/GPU); keep ORT sequential to avoid contention.
+        opts.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
+        if intra_threads == 0:
+            intra_threads = 1
+    else:
+        # x86_64: exploit all physical cores across ops and within each op.
+        opts.execution_mode = rt.ExecutionMode.ORT_PARALLEL
+        cpu_count = os.cpu_count() or 4
+        if intra_threads == 0:
+            intra_threads = cpu_count
+        if inter_threads == 0:
+            inter_threads = max(1, cpu_count // 2)
+
     if intra_threads > 0:
         opts.intra_op_num_threads = intra_threads
     if inter_threads > 0:
         opts.inter_op_num_threads = inter_threads
+
     opts.enable_mem_pattern = os.environ.get("OEMER_ONNX_DISABLE_MEM_PATTERN") != "1"
+    opts.enable_cpu_mem_arena = True
+
+    # Persist the ORT-optimized graph so subsequent cold starts skip graph-optimization overhead.
+    if opt_path:
+        opts.optimized_model_filepath = opt_path
+
     return opts
+
+
+def _provider_tag(provider):
+    """Short lowercase label used in cache-file names (avoids cross-provider cache pollution)."""
+    name = provider if isinstance(provider, str) else provider[0]
+    return name.replace("ExecutionProvider", "").lower()
 
 
 @lru_cache(maxsize=4)
@@ -134,16 +171,34 @@ def _load_onnx_session(model_path):
         os.environ.get("OEMER_ONNXRUNTIME_PROVIDER")
         or os.environ.get("OMR_OEMER_ONNXRUNTIME_PROVIDER")
     )
-    missing = [provider for provider in requested_providers if provider not in available]
+    missing = [p for p in requested_providers if p not in available]
     if explicit and requested_providers[0] in missing:
         raise RuntimeError(
             f"Requested ONNXRuntime provider {requested_providers[0]} is unavailable; "
             f"available providers: {sorted(available)}"
         )
-    providers = [provider for provider in requested_providers if provider in available]
+
+    # Build provider list; attach CoreML options to request ANE + GPU dispatch.
+    providers = []
+    for p in requested_providers:
+        if p not in available:
+            continue
+        if p == "CoreMLExecutionProvider":
+            providers.append((p, {"MLComputeUnits": "ALL"}))
+        else:
+            providers.append(p)
     if not providers:
         providers = ["CPUExecutionProvider"]
-    sess = rt.InferenceSession(onnx_path, sess_options=_onnx_session_options(), providers=providers)
+
+    # Per-provider optimized graph cache: avoids re-running graph optimization on each cold start.
+    tag = _provider_tag(providers[0])
+    opt_path = os.path.join(model_path, f"model_opt_{tag}.onnx")
+    if os.path.exists(opt_path):
+        load_path, sess_opts = opt_path, _onnx_session_options()
+    else:
+        load_path, sess_opts = onnx_path, _onnx_session_options(opt_path)
+
+    sess = rt.InferenceSession(load_path, sess_options=sess_opts, providers=providers)
     return sess, metadata
 
 
@@ -220,6 +275,26 @@ def inference(model_path, img_path, step_size=128, batch_size=16, manual_th=None
 @lru_cache(maxsize=8)
 def _load_sklearn_model(model_name):
     return pickle.load(open(os.path.join(MODULE_PATH, f"sklearn_models/{model_name}.model"), "rb"))
+
+
+def should_parallel_inference():
+    """True when running both ONNX models concurrently is beneficial.
+
+    Apple Silicon: CoreML dispatches each session to ANE independently.
+    CUDA x86_64: GPU compute is independent of CPU threads.
+    Pure-CPU x86_64: parallelism would over-subscribe cores — skip.
+    """
+    override = os.environ.get("OEMER_PARALLEL_INFERENCE", "").strip()
+    if override:
+        return override == "1"
+    arch = _machine_arch()
+    if platform.system() == "Darwin" and arch == "arm64":
+        return True
+    try:
+        import onnxruntime as rt
+        return "CUDAExecutionProvider" in rt.get_available_providers()
+    except ImportError:
+        return False
 
 
 def predict(region, model_name):

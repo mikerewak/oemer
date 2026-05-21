@@ -4,8 +4,7 @@ import pickle
 import cv2
 import numpy as np
 import scipy.ndimage
-from scipy.interpolate import interp1d, griddata
-from sklearn.linear_model import LinearRegression
+from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
 
 from oemer.morph import morph_open
@@ -56,26 +55,26 @@ class GridGroup:
 def build_grid(st_pred, split_unit=11):
     grid_map = np.zeros(st_pred.shape) - 1
     h, w = st_pred.shape
-
-    is_on = lambda data: np.sum(data) > split_unit//2
-
     grids = []
+
     for i in range(0, w, split_unit):
-        cur_y = 0
-        last_y = 0
-        cur_stat = is_on(st_pred[cur_y, i:i+split_unit])
-        while cur_y < h:
-            while cur_y < h and cur_stat == is_on(st_pred[cur_y, i:i+split_unit]):
-                cur_y += 1
-            if cur_stat and (cur_y-last_y < split_unit):
-                # Switch off
-                grid_map[last_y:cur_y, i:i+split_unit] = len(grids)
+        col_block = st_pred[:, i:i+split_unit]
+        on_mask = col_block.sum(axis=1) > split_unit // 2  # vectorized per-row check
+
+        padded = np.concatenate([[False], on_mask, [False]])
+        diff = np.diff(padded.astype(np.int8))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+
+        for s, e in zip(starts, ends):
+            if (e - s) < split_unit:
+                gid = len(grids)
+                grid_map[s:e, i:i+split_unit] = gid
                 gg = Grid()
-                gg.bbox = (i, last_y, i+split_unit, cur_y)
-                gg.id = len(grids)
+                gg.bbox = (i, s, i + split_unit, e)
+                gg.id = gid
                 grids.append(gg)
-            cur_stat = not cur_stat
-            last_y = cur_y
+
     return grid_map, grids
 
 
@@ -135,16 +134,17 @@ def connect_nearby_grid_group(gg_map, grid_groups, grid_map, grids, ref_count=8,
         # Extend on the left side
         step_size = gg.split_unit
         centers = [grids[gid].y_center for gid in ref_gids]
-        x = np.arange(len(centers)).reshape(-1, 1) * step_size
-        model = LinearRegression().fit(x, centers)
+        x_arr = np.arange(len(centers)) * step_size
+        coef = np.polyfit(x_arr, centers, 1)  # [slope, intercept]
         ref_box = grids[ref_gids[0]].bbox
 
         end_x = ref_box[0]
         h = ref_box[3] - ref_box[1]
+        # Pre-compute y-centers for all steps; early break still handled inside loop.
+        tar_xs = np.array([(-i - 1) * step_size for i in range(max_step)])
+        cen_ys = np.polyval(coef, tar_xs)
         cands_box = []  # Potential trajectory
-        for i in range(max_step):
-            tar_x = (-i - 1) * step_size
-            cen_y = model.predict([[tar_x]])[0]  # Interpolate y center
+        for i, cen_y in enumerate(cen_ys):
             y = int(round(cen_y - h / 2))
             region = new_gg_map[y:y+h, end_x-step_size:end_x]  # Area to check
             unique, counts = np.unique(region, return_counts=True)
@@ -187,14 +187,13 @@ def connect_nearby_grid_group(gg_map, grid_groups, grid_map, grids, ref_count=8,
                 grid = grids[grid_id]
 
                 # Interpolate y centers between the start and end points again.
-                centers = [grid.y_center, centers[0]]
-                x = [-i-1, 0]
-                inter_func = interp1d(x, centers, kind='linear')
+                end_centers = [grid.y_center, centers[0]]
+                end_xs = [-i-1, 0]
 
                 # Start to insert grids between points
                 cands_ids = []
                 for bi, box in enumerate(cands_box):
-                    interp_y = round(inter_func(-bi-1) - h/2)
+                    interp_y = round(np.interp(-bi-1, end_xs, end_centers) - h/2)
                     grid = Grid()
                     box = (box[0], interp_y, box[2], interp_y+h)
                     grid.bbox = box
