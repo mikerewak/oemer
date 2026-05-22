@@ -155,10 +155,12 @@ def extract(args):
     if not args.without_deskew:
         logger.info("Dewarping")
         coords_x, coords_y = estimate_coords(staff)
-        # All five binary prediction maps in one remap call (5-channel stack).
-        pred_stack = np.stack([staff, symbols, stems_rests, clefs_keys, notehead], axis=-1).astype(np.float32)
-        pred_warped = cv2.remap(pred_stack, coords_x, coords_y, cv2.INTER_CUBIC)
-        staff, symbols, stems_rests, clefs_keys, notehead = (pred_warped[..., i] for i in range(5))
+        # cv2.remap caps at 4 channels (OpenCV 4.13+ asserts), so batch the
+        # five prediction maps as 4 + 1 instead of a single 5-channel stack.
+        pred_stack_a = np.stack([staff, symbols, stems_rests, clefs_keys], axis=-1).astype(np.float32)
+        pred_warped_a = cv2.remap(pred_stack_a, coords_x, coords_y, cv2.INTER_CUBIC)
+        notehead = cv2.remap(notehead.astype(np.float32), coords_x, coords_y, cv2.INTER_CUBIC)
+        staff, symbols, stems_rests, clefs_keys = (pred_warped_a[..., i] for i in range(4))
         # cv2.remap natively handles 3-channel images — no per-channel loop needed.
         image = cv2.remap(image.astype(np.float32), coords_x, coords_y, cv2.INTER_CUBIC).clip(0, 255).astype(np.uint8)
 
