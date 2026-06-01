@@ -240,7 +240,7 @@ def parse_clefs_keys(clefs_keys, unit_size, clef_size_ratio=3.5, max_clef_tp_rat
     global cs_img
     cs_img = to_rgb_img(clefs_keys)
 
-    ker = np.ones((np.int(unit_size//2), 1), dtype=np.uint8)
+    ker = np.ones((int(unit_size//2), 1), dtype=np.uint8)
     clefs_keys = cv2.erode(cv2.dilate(clefs_keys.astype(np.uint8), ker), ker)
     bboxes = get_bbox(clefs_keys)
     bboxes = filter_out_of_range_bbox(bboxes)

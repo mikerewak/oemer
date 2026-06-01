@@ -319,12 +319,35 @@ def extract(splits=8, line_threshold=0.8, horizontal_diff_th=0.1, unit_size_diff
     # Fetch parameters from layers
     staff_pred = layers.get_layer('staff_pred')
 
+    # Stavewave guard (V59 — thin-crop fix 2026-06-01): degenerate seg_net
+    # outputs on very thin staff crops can leave staff_pred 1D (no width axis)
+    # or empty, which then raises a cryptic ``IndexError: too many indices for
+    # array`` from the ``staff_pred[:, rr]`` slice below. Convert the failure
+    # mode into a typed exception so the Sibelius oemer adapter can recognise
+    # it as a non-retryable geometry failure and bail out cleanly instead of
+    # bouncing through the single-system retry strategy.
+    if not isinstance(staff_pred, np.ndarray) or staff_pred.ndim != 2:
+        raise E.StafflineException(
+            "staff_pred must be a 2D ndarray; got "
+            f"type={type(staff_pred).__name__} "
+            f"shape={getattr(staff_pred, 'shape', None)}"
+        )
+    if staff_pred.size == 0 or staff_pred.shape[1] == 0:
+        raise E.StafflineException(
+            f"staff_pred is empty (shape={staff_pred.shape}); "
+            "input crop has no detectable staff signal"
+        )
+
     # Start process
     zones, *_ = init_zones(staff_pred, splits=splits)
     all_staffs = []
     for rr in zones:
         print(rr[0], rr[-1], end=' ')
-        rr = np.array(rr, dtype=np.int)
+        rr = np.array(rr, dtype=int)
+        if rr.size == 0:
+            # Stavewave guard: empty zone produces (H, 0) slice which then
+            # crashes inside ``extract_line`` peak finding. Skip and continue.
+            continue
         staffs = extract_part(staff_pred[:, rr], x_offset=rr[0], line_threshold=line_threshold)
         if staffs is not None:
             all_staffs.append(staffs)
@@ -375,6 +398,30 @@ def extract_part(pred, x_offset, line_threshold=0.8):
     # To assure there contains at leat one staff lines and above
     if len(lines) < 5:
         return None
+
+    # Stavewave guard (V59 — thin-crop fix 2026-06-01): on tightly cropped
+    # bands (e.g. 1700×279) ``extract_line`` occasionally returns a line count
+    # that is not a multiple of 5, or assigns labels that do not match the
+    # cyclic 0..4 progression because of a single mis-grouped peak. Truncating
+    # to the largest 5-line multiple and re-deriving labels by positional
+    # order keeps the rest of the pipeline going instead of raising
+    # AssertionError that the adapter has to convert to OemerUnavailable.
+    usable = (len(lines) // 5) * 5
+    if usable == 0:
+        return None
+    if usable != len(lines):
+        lines = lines[:usable]
+    expected_first = LineLabel(0)
+    bad_label = any(
+        line.label != LineLabel(idx % 5) for idx, line in enumerate(lines)
+    )
+    if bad_label:
+        # Lines are already y-sorted by ``extract_line`` (via the sorted
+        # ``pack`` of Line objects compared on y_center). Re-stamp labels in
+        # positional order so the downstream Staff assembly below sees a
+        # clean 0..4 cycle.
+        for idx, line in enumerate(lines):
+            line.label = LineLabel(idx % 5)
 
     staffs = []
     line_buffer = []
